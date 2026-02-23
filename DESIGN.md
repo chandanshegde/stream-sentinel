@@ -68,7 +68,7 @@ This project deliberately uses production-grade components (Pulsar for multi-top
 
 | ID  | Requirement                                                                                                      |
 | --- | ---------------------------------------------------------------------------------------------------------------- |
-| F-1 | Ingest raw events via `POST /api/v1/ingest` (≤ 200 KB payload) and via internal Pulsar producers.                |
+| F-1 | Ingest raw events via `POST /api/v1/ingest` (REST/JSON) and `gRPC` (Protobuf) (≤ 200 KB payload).                |
 | F-2 | Detect abuse categories: `TOXICITY`, `HATE_SPEECH`, `THREAT`, `DOXXING`, `SPAM`.                                 |
 | F-3 | Detect PII types: emails, SSNs, credit cards, IPs, auth tokens, phone numbers, names (NER).                      |
 | F-4 | Redaction modes configurable per `(tenant, service)`: `NONE` / `PARTIAL` (pseudonymize) / `FULL` (redact).       |
@@ -201,20 +201,19 @@ flowchart TD
 
 ### 6.1 Ingest API (Spring Boot)
 
-**Technology**: Spring Boot 3.x + Spring Web + `pulsar-client` Java SDK.
+**Technology**: Spring Boot 3.x + Spring Web + gRPC-Spring-Boot-Starter + `pulsar-client` Java SDK.
 
-**Why Spring Boot for the API tier?**
+**Why support both REST and gRPC?**
 
-- Familiar to Java teams; autoconfiguration for Pulsar (`spring-pulsar`) simplifies producer setup.
-- Spring Actuator exposes `/health`, `/metrics` (Micrometer → Prometheus) out of the box.
-- Allows future extension: Spring Security for token auth, Spring Validation for input constraints.
+- **REST (JSON):** Familiar to external clients, Web/Mobile, and allows low-barrier integration via simple HTTP POSTs.
+- **gRPC (Protobuf / Apache Arrow IPC):** For high-throughput internal microservices. gRPC over HTTP/2 with binary Protobuf serialization drastically reduces CPU overhead and network bandwidth. Furthermore, gRPC endpoints can be structured to accept **Apache Arrow IPC** streams natively, avoiding JVM serialization overhead entirely.
 
 **Key design choices:**
 
-- **Fire-and-forget publish**: the REST handler publishes to Pulsar _asynchronously_ (`CompletableFuture`) and returns `202 Accepted` immediately — decoupling API latency from processing latency.
+- **Fire-and-forget publish**: the handler publishes to Pulsar _asynchronously_ (`CompletableFuture`) and returns `202 Accepted` immediately — decoupling API latency from processing latency.
 - **Producer pooling**: a single `PulsarClient` with a cached `Producer<byte[]>` per topic avoids connection churn under load.
 - **Rate limiting**: Resilience4j `RateLimiter` annotation on the ingest endpoint (configurable per `X-Tenant-ID` header) to prevent a single tenant from flooding the topic.
-- **Schema registry**: Pulsar's built-in Schema Registry enforces the `RawEvent` Avro schema at publish time — invalid payloads are rejected before they enter the pipeline.
+- **Schema registry**: Pulsar's built-in Schema Registry enforces the `RawEvent` Avro or Protobuf schema at publish time — invalid payloads are rejected before they enter the pipeline.
 
 ```java
 // Example: async publish in Spring Boot controller
@@ -289,30 +288,44 @@ Flink is the de-facto standard for stateful, low-latency stream processing at sc
 PulsarSource (1–16 parallel)
   └─ MapOperator: Parse & Validate          [parallelism=16]
        ├─ SideOutput(DLQ): invalid events   [→ DLQ sink]
-       └─ MapOperator: Deterministic Redact  [parallelism=16, stateless]
-            └─ AsyncOperator: NER call       [parallelism=8, unordered]
-                 └─ MapOperator: Abuse Score  [parallelism=8]
+       └─ MapOperator: Deterministic Redact (Regex + WASM) [parallelism=16, stateless]
+            └─ AsyncOperator: NER call (Arrow Flight) [parallelism=8, unordered]
+                 └─ MapOperator: Abuse Score (Embedded DJL) [parallelism=8]
                       └─ ProcessOperator: Escalation Decision
                            ├─ AsyncOperator: LLM Adapter [parallelism=4]
                            └─ MapOperator: Finalize Redaction [parallelism=8]
                                 └─ TwoPhaseCommitSink:
                                      ├─ PulsarSink (sanitized-events)
-                                     └─ JdbcSink (Postgres)
+                                     ├─ JdbcSink (Postgres)
+                                     └─ IcebergSink (Parquet)
 ```
 
-**Parallelism strategy**: NER and LLM calls are I/O-bound, so they run at lower parallelism with async buffering. CPU-bound operators (regex, scoring) run at max parallelism.
+**Parallelism Strategy:**
+NER and LLM calls are I/O-bound, so they run at lower parallelism with async buffering. CPU-bound operators (regex, WASM, embedded scoring) run at max parallelism.
+
+**Tenant-Specific UDFs (WebAssembly):**
+To support dynamic, tenant-level redaction logic without hardcoding rules into Flink or making slow HTTP calls, the deterministic redaction step embeds a **WASM Runtime** (e.g., Wasmtime via JNI or GraalWasm).
+
+- Tenants can upload custom scrubber functions written in Rust/AssemblyScript, compiled to WASM.
+- Flink executes these functions inline, safely sandboxed from the rest of the JVM, at near-native speeds.
 
 ---
 
-### 6.4 NER Microservice
+### 6.4 NER Microservice (Apache Arrow Flight)
 
-**Technology**: Python + FastAPI + spaCy `en_core_web_lg` (or Flair for higher accuracy).
+**Technology**: Python + FastAPI / Arrow Flight Server + spaCy `en_core_web_lg` (or Rust + Arrow).
 
-**Why a separate microservice?**
+**Why Arrow Flight instead of REST?**
+A major bottleneck in calling a Python ML service from Java is serialization. Instead of REST/JSON (which requires converting objects to JSON strings, sending over HTTP, and parsing in Python), we use **Apache Arrow Flight**.
 
-- ML model lifecycle is independent of the Flink job lifecycle (hot-reload models without redeploying the job).
-- Flink is JVM-based; calling Python models natively requires GraalVM or Jep — a microservice boundary is cleaner and testable independently.
-- Can be replaced with a different model (e.g., a fine-tuned BERT) without touching Flink.
+- **Zero-Copy Deserialization:** Flink batches events into an Apache Arrow in-memory columnar format and sends it via Arrow Flight (built on gRPC).
+- The Python service receives the exact memory layout and reads it into Pandas/NumPy instantly without any deserialization overhead.
+
+**Why a separate microservice at all?**
+
+- ML model lifecycle is independent of the Flink job lifecycle.
+- Isolating heavy GPU/Memory requirements natively rather than bridging them inside Flink.
+- Python possesses the best-in-class NLP ecosystems (spaCy, Transformers).
 
 **Endpoint design:**
 
@@ -336,19 +349,20 @@ Response: {
 
 ---
 
-### 6.5 Abuse Classifier
+### 6.5 Abuse Classifier (Embedded ML)
 
 **Strategy**: layered, from cheapest to most accurate:
 
 1. **Token blocklist** (O(1) hash lookup) — catches obvious slurs and known patterns instantly.
-2. **Regex patterns** — threats ("I will find you", "you're dead"), credential patterns, URL patterns.
-3. **TF-IDF + Logistic Regression** (scikit-learn, exported to ONNX) — fast, no GPU needed, handles common abuse patterns. Retrain weekly on labeled data.
-4. **Fine-tuned DistilBERT** (ONNX Runtime inference) — higher accuracy, ~50 ms per event, used only when LR confidence < 0.8.
-5. **LLM escalation** — only for genuinely ambiguous edge cases.
+2. **Regex patterns & WASM UDFs** — threats ("I will find you", "you're dead"), credential patterns, URL patterns, or tenant-specific logic.
+3. **Embedded Fine-tuned DistilBERT (ONNX + DJL)** — high accuracy (~5 ms per event).
+4. **LLM escalation** — only for genuinely ambiguous edge cases.
 
-**Why ONNX?** Models exported to ONNX can be run from Java via `onnxruntime-java` — this allows the classifier to run _inside_ the Flink job without an extra network hop, reducing latency.
+**Why Embedded ONNX via DJL?**
+Instead of making an external network call for every event to calculate an abuse score, we load the ONNX version of our abuse model directly inside the Flink TaskManager's JVM memory.
 
----
+- We use the **Deep Java Library (DJL)** natively in the Flink operator to run the inference.
+- This entirely eliminates network hops, solving the "why not do this for NER too?" tradeoff: DistilBERT for raw classification converts perfectly to self-contained ONNX matrices, whereas NER often requires complex NLP tokenization pipelines (like spaCy) that are harder to embed purely in Java without complex JNI bridging.
 
 ### 6.6 LLM Adapter
 
@@ -375,21 +389,25 @@ Input to LLM = {
 
 ---
 
-### 6.7 Storage Layer
+### 6.7 Storage Layer (Data Lakehouse)
 
-**Postgres** (primary operational store):
+**Apache Iceberg (Analytical Store):**
+To avoid creating a "compliance time-bomb" in a generic S3 data lake, we use **Apache Iceberg** as our open table format.
 
-- `events_sanitized`: final sanitized events, JSONB payload for flexibility + GIN index for JSON path queries.
-- `audit_records`: append-only, no UPDATE/DELETE allowed (enforced by row-level triggers), partitioned by month.
+- Iceberg provides ACID transactions, schema evolution, and hidden partitioning on top of our object store (S3/MinIO).
+- Data is written as strongly-typed **Apache Parquet** files (optimized for on-disk compression and columnar querying).
+- We use a **REST Catalog** (or **Project Nessie** for Git-like data versioning/branching) to manage the metadata. This allows Data Science teams to safely branch the sanitized event data, run experimental models, and merge results back.
+
+**Postgres** (Operational / Metadata store):
+
+- `events_sanitized_latest`: Used for recent, hot queries and point lookups via JSONB. (Older events are offloaded to Iceberg).
+- `audit_records`: append-only, no UPDATE/DELETE allowed (enforced by row-level triggers).
 - `escalations`: tracks LLM + human review lifecycle (status: `PENDING → IN_REVIEW → RESOLVED`).
 
 **pgvector / Qdrant** (semantic search for chatbot):
 
 - Sanitized event payloads are embedded (sentence-transformers) and stored as vectors.
 - Enables the AI chatbot to answer: _"Find all incidents involving doxxing in the last 7 days"_ via semantic similarity search.
-
-**Why not a NoSQL store for events?**
-Postgres with JSONB gives you the flexibility of a document store with the consistency guarantees of a relational DB — critical for the audit trail (no phantom reads, transactional inserts). A purpose-built OLTP DB also makes joins between `audit_records` and `escalations` efficient for compliance reports.
 
 ---
 
@@ -616,20 +634,25 @@ Apply pseudonymization: `HMAC-SHA256(tenantSalt, entityValue)` truncated to 12 c
 ### Stage 9: Sinks (Exactly-Once)
 
 ```java
-// Two-phase commit sink for Postgres
+// Two-phase commit sink for Postgres (Hot store)
 FlinkSink.<ProcessedEvent>builder()
     .withRowDataType(ProcessedEvent.class)
     .withJdbcUrl(jdbcUrl)
     .withSql("INSERT INTO events_sanitized (...) VALUES (?) ON CONFLICT (id) DO NOTHING")
     .build();
 
-// Pulsar sink — transactional producer
+// Pulsar sink — transactional producer (Downstream real-time consumers)
 PulsarSink<ProcessedEvent> pulsarSink = PulsarSink.<ProcessedEvent>builder()
     .setServiceUrl(pulsarUrl)
     .setTopic("persistent://public/default/sanitized-events")
     .setSerializationSchema(new AvroSerializationSchema<>(ProcessedEvent.class))
     .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
     .build();
+
+// Iceberg sink — Analytical Lakehouse
+IcebergSink.Builder<ProcessedEvent> icebergSink = IcebergSink.forRowData(processedEventStream)
+    .tableLoader(TableLoader.fromCatalog(catalogLoader, TableIdentifier.of("security", "sanitized_events")))
+    .append();
 ```
 
 ---
@@ -1072,9 +1095,19 @@ Answer: Flink's web UI shows operator back-pressure indicators. Prometheus metri
 3. **Consider a dedicated audit log system** (e.g., Apache Iceberg on S3) instead of Postgres for long-term audit retention — Postgres partition management for 7 years of data is operationally heavy.
 4. **Separate the "detection" and "redaction" concerns more cleanly** — detection outputs a structured annotation (entity type, position, confidence); redaction is a pure function of annotations + policy. This makes testing and auditing simpler.
 
+### 18.9 Advanced Architecture Concepts (Arrow, WASM, Iceberg, ONNX)
+
+| Question                          | Key Answer                                                                                                                                                                                                                                                                              |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Why Arrow Flight for Python?**  | Calling Python from Java usually requires slow JSON serialization over HTTP. Arrow Flight sends in-memory Apache Arrow column buffers directly over gRPC, allowing Python to read them with **zero-copy deserialization**.                                                              |
+| **Why WASM UDFs?**                | Tenants often need custom redaction rules. Instead of hardcoding them in Java or making slow HTTP calls, tenants compile their logic into WebAssembly (Rust/AssemblyScript). Flink runs them securely via an embedded WASM sandboxed runtime (GraalWasm/Wasmtime) at near-native speed. |
+| **Why DJL/ONNX instead of REST?** | Making network calls for abuse classification adds 50-100ms per event and creates a point of failure. By exporting the model to ONNX, we load it directly into the Flink JVM using Deep Java Library (DJL). Inference happens locally in ~5ms without network hops.                     |
+| **Why Apache Iceberg?**           | Dumping JSON/CSV to S3 creates a "data swamp." Iceberg provides an open table format with ACID transactions, schema evolution, and hidden partitioning. Data is saved as Parquet formats for extreme compression and fast querying by engines like Athena or Trino.                     |
+| **Does Rust fit anywhere?**       | Yes! Rust is ideal for the backend of the WASM UDFs (compiling safely to WASM for Flink injection) or writing ultra-low latency implementations of the Arrow Flight NER worker.                                                                                                         |
+
 ---
 
-### 18.9 Common Flink-Specific Questions
+### 18.10 Common Flink-Specific Questions
 
 | Question                           | Key Answer                                                                                                                                                                                            |
 | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -1,12 +1,12 @@
 %%{init: {"theme": "default"}}%%
 flowchart TD
   subgraph Producers["🟦 Producers"]
-    A["REST Ingest API\nSpring Boot 3.x\nPOST /api/v1/ingest\nAsync publish · 202 Accepted"]
-    B["Internal Producers\nPulsar SDK / Event Sources"]
+    A["REST & gRPC Ingest API\nSpring Boot 3.x\nJSON & Protobuf\nAsync publish · 202 Accepted"]
+    B["Internal Producers\nPulsar SDK / gRPC Clients"]
   end
 
   subgraph PulsarBus["🟧 Apache Pulsar (Message Bus)"]
-    RAW["persistent://{tenant}/ingestion/raw-events\n16 partitions · 24h retention\nAvro schema enforced"]
+    RAW["persistent://{tenant}/ingestion/raw-events\n16 partitions · 24h retention\nSchema Registry enforced"]
     SAN["persistent://{tenant}/ingestion/sanitized-events\n16 partitions · 7d retention"]
     AUD["persistent://{tenant}/ingestion/audit-events\n4 partitions · 7d → S3 tiered"]
     DLQ["persistent://{tenant}/ingestion/dlq\n4 partitions · 30d retention"]
@@ -14,14 +14,14 @@ flowchart TD
 
   subgraph FlinkJob["🟩 Flink Streaming Job (Java)"]
     direction TB
-    F1["① Parse & Validate\nJSON Schema · Side-output DLQ\nparallelism=16"]
-    F2["② Deterministic Redaction\nRegex: email·SSN·CC·token·IP\nStateless · parallelism=16"]
-    F3["③ Async NER Call\nAsyncDataStream.unorderedWait\nBatch=64 · timeout=5s · parallelism=8"]
-    F4["④ Abuse Scoring\nONNX Runtime Java\nDistilBERT / LR model · parallelism=8"]
+    F1["① Parse & Validate\nJSON/Protobuf · Side-output DLQ\nparallelism=16"]
+    F2["② Redaction (Regex + WASM)\nEmbedded WASM UDFs per tenant\nStateless · parallelism=16"]
+    F3["③ Async NER Call\nArrow Flight (Zero-copy RPC)\nBatch=64 · timeout=5s · parallelism=8"]
+    F4["④ Abuse Scoring\nEmbedded DJL + ONNX\nDistilBERT natively in JVM · parallelism=8"]
     F5["⑤ Escalation Decision\nKeyedProcessFunction on tenantId\nBroadcastState for tenant policy"]
     F6["⑥ Async LLM Adapter\nAsyncDataStream.orderedWait\nmaxInFlight=20 · circuit-breaker · parallelism=4"]
     F7["⑦ Finalize Redaction\nHMAC-SHA256 pseudonymization\nKMS-managed salt per tenant"]
-    F8["⑧ Sinks\nTwoPhaseCommitSink\nPulsar + Postgres (idempotent upsert)"]
+    F8["⑧ Sinks\nTwoPhaseCommitSink\nPulsar + Postgres + Iceberg"]
 
     F1 -->|valid| F2
     F1 -->|invalid| DLQ
@@ -35,7 +35,7 @@ flowchart TD
   end
 
   subgraph NERService["🟪 NER Microservice"]
-    NER["FastAPI + spaCy / Flair\nPERSON · EMAIL · ORG · CC · SSN\nSidecar pod (co-located with Flink TM)"]
+    NER["NER Worker \nPython + spaCy / Rust\nArrow Flight Server\nSidecar pod"]
   end
 
   subgraph LLMAdapterSvc["🟥 LLM Adapter"]
@@ -44,11 +44,12 @@ flowchart TD
 
   subgraph Storage["🗄️ Storage Layer"]
     PG[("Postgres (pgvector)\nevents_sanitized\naudit_records (append-only)\nescalations")]
+    ICE[("Apache Iceberg\nParquet Files on S3\nREST/Nessie Catalog")]
     VEC[("Vector Store\nEmbeddings for RAG\nSemantic incident search")]
   end
 
   subgraph Downstream["📤 Downstream Consumers"]
-    ANA["Analytics / BI\nApache Iceberg / Flink batch"]
+    ANA["Analytics / BI\nAthena / Flink batch over Iceberg"]
     CHAT["AI Chatbot\nRAG over audit + sanitized events\npgvector similarity search"]
     MOD["Human Review UI\nEscalations queue\nPATCH /escalations/{id}"]
   end
@@ -62,7 +63,7 @@ flowchart TD
   A --> RAW
   B --> RAW
   RAW --> F1
-  F3 <-->|"POST /ner/detect\nbatched async"| NER
+  F3 <-->|"Arrow Flight RPC\nin-memory Arrow IPC"| NER
   F6 <-->|"POST /llm/classify\nredacted context only"| LLM
   F8 --> SAN
   F8 --> AUD
