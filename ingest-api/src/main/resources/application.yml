@@ -1,0 +1,11 @@
+server:
+  port: 8081
+
+pulsar:
+  service-url: ${PULSAR_SERVICE_URL:pulsar://localhost:6650}
+  topic:
+    raw-events: persistent://public/default/raw-events
+
+spring:
+  application:
+    name: ingest-api

@@ -1,6 +1,6 @@
 # Abuse & PII Filtering — Stream Ingestion Pipeline
 
-> **Portfolio Project** · Java / Spring Boot · Apache Pulsar · Apache Flink · NER + LLM Adapter
+> **Portfolio Project** · Java / Spring Boot · Pulsar · **Spark Streaming / Flink** · Presidio + NER
 >
 > _Demonstrates: high-throughput streaming design, distributed systems engineering, AI/ML integration, compliance-grade security, and production observability — all strong talking points for senior backend & system-design interviews._
 
@@ -32,6 +32,11 @@
 15. [API Reference](#15-api-reference)
 16. [Implementation Milestones](#16-implementation-milestones)
 17. [Key Design Decisions & Trade-offs](#17-key-design-decisions--trade-offs)
+
+- 17.1 [Architecture Choices](#171-architecture-choices)
+- 17.2 [Alternative Engine Selection (Spark vs. Flink)](#172-alternative-engine-selection-spark-vs-flink)
+- 17.3 [Engine-Agnostic Core Logic](#173-engine-agnostic-core-logic)
+
 18. [Interview Prep — Scenarios, Questions & Model Answers](#18-interview-prep--scenarios-questions--model-answers)
 
 ---
@@ -199,9 +204,15 @@ flowchart TD
 
 ## 6. Component Deep-Dives
 
-### 6.1 Ingest API (Spring Boot)
+### 6.1 Ingest API (Spring Boot / GraalVM)
 
-**Technology**: Spring Boot 3.x + Spring Web + gRPC-Spring-Boot-Starter + `pulsar-client` Java SDK.
+**Technology**: Spring Boot 3.x (compiled to **GraalVM Native Image**) + Spring Web + gRPC-Spring-Boot-Starter + `pulsar-client` Java SDK.
+
+**Why GraalVM Native Image?**
+
+- **Instant Startup**: Native compilation means the application starts in milliseconds. This is critical for instantaneous scaling via horizontal pod auto-scalers (HPA) in Kubernetes when traffic spikes unexpectedly.
+- **Low Memory Footprint**: Uses a fraction of the RAM of a traditional JIT-compiled JVM, allowing us to run more dense pods per node, cutting cloud costs.
+- **Showcase Signal**: Running GraalVM in production demonstrates deep understanding of modern Java performance optimization.
 
 **Why support both REST and gRPC?**
 
@@ -311,9 +322,16 @@ To support dynamic, tenant-level redaction logic without hardcoding rules into F
 
 ---
 
-### 6.4 NER Microservice (Apache Arrow Flight)
+### 6.4 NER Microservice (Apache Arrow Flight / Microsoft Presidio)
 
-**Technology**: Python + FastAPI / Arrow Flight Server + spaCy `en_core_web_lg` (or Rust + Arrow).
+**Technology**: Python + Microsoft Presidio / spaCy + Arrow Flight Server.
+
+**Why Microsoft Presidio?**
+While spaCy is a powerful NLP library, **Microsoft Presidio** (open-source) is specifically designed for PII detection and anonymization.
+
+- **Layered Approach**: Presidio combines regex-based "Recognizers" for deterministic PII (emails, cards) with ML models (spaCy/Transformers) for context-based PII (names, addresses).
+- **Extensibility**: Easy to add "Custom Recognizers" for domain-specific sensitivity (e.g., internal employee IDs).
+- **Showcase Signal**: Using Presidio signals that you understand security-first SDKs rather than just generic NLP.
 
 **Why Arrow Flight instead of REST?**
 A major bottleneck in calling a Python ML service from Java is serialization. Instead of REST/JSON (which requires converting objects to JSON strings, sending over HTTP, and parsing in Python), we use **Apache Arrow Flight**.
@@ -392,9 +410,9 @@ Input to LLM = {
 ### 6.7 Storage Layer (Data Lakehouse)
 
 **Apache Iceberg (Analytical Store):**
-To avoid creating a "compliance time-bomb" in a generic S3 data lake, we use **Apache Iceberg** as our open table format.
+To avoid creating a "compliance time-bomb" in a generic data lake, we use **Apache Iceberg** as our open table format.
 
-- Iceberg provides ACID transactions, schema evolution, and hidden partitioning on top of our object store (S3/MinIO).
+- Iceberg provides ACID transactions, schema evolution, and hidden partitioning on top of our object store (**MinIO** for local/on-prem, S3 for cloud).
 - Data is written as strongly-typed **Apache Parquet** files (optimized for on-disk compression and columnar querying).
 - We use a **REST Catalog** (or **Project Nessie** for Git-like data versioning/branching) to manage the metadata. This allows Data Science teams to safely branch the sanitized event data, run experimental models, and merge results back.
 
@@ -408,6 +426,12 @@ To avoid creating a "compliance time-bomb" in a generic S3 data lake, we use **A
 
 - Sanitized event payloads are embedded (sentence-transformers) and stored as vectors.
 - Enables the AI chatbot to answer: _"Find all incidents involving doxxing in the last 7 days"_ via semantic similarity search.
+
+**Trino / Presto (Analytical SQL Engine):**
+For historical large-scale analysis on the data lake (Iceberg/S3), we use **Trino**.
+
+- **Role**: Unlike Spark/Flink which handle "Data in Motion," Trino is for **"Data at Rest."**
+- **Showcase**: Demonstrates understanding of the "Lakehouse" architecture where streaming jobs ingest data, and SQL engines like Trino provide high-speed analytical access for BI/Data Science without creating data silos.
 
 ---
 
@@ -442,24 +466,20 @@ To avoid creating a "compliance time-bomb" in a generic S3 data lake, we use **A
   "redaction_level": "PARTIAL",
   "abuse_category": "THREAT",
   "abuse_score": 0.91,
-  "provenance": [
+  "redactions": [
     {
-      "step": "REGEX",
-      "rule": "email_pattern_v2",
+      "entityType": "EMAIL",
+      "originalValue": "john.doe@example.com",
+      "redactedValue": "<EMAIL_REDACTED>",
       "confidence": 1.0,
-      "actor": "DeterministicRedactor"
+      "source": "REGEX"
     },
     {
-      "step": "NER",
-      "entity": "EMAIL",
+      "entityType": "PERSON",
+      "originalValue": "john",
+      "redactedValue": "<PERSON>",
       "confidence": 0.99,
-      "actor": "SpacyNerService/v2.1"
-    },
-    {
-      "step": "CLASSIFY",
-      "model": "distilbert_abuse_v3",
-      "confidence": 0.91,
-      "actor": "AbuseClassifier"
+      "source": "NER_PRESIDIO"
     }
   ]
 }
@@ -471,12 +491,11 @@ To avoid creating a "compliance time-bomb" in a generic S3 data lake, we use **A
 {
   "audit_id": "b2c3d4e5-...",
   "event_id": "a1b2c3d4-...",
-  "step": "REGEX",
-  "before_digest": "sha256:abc...",
-  "after_snippet": "... <EMAIL_REDACTED> ...",
-  "actor": "DeterministicRedactor",
-  "rule": "email_pattern_v2",
+  "entity_type": "EMAIL",
+  "original_value": "john.doe@example.com",
+  "redacted_value": "<EMAIL_REDACTED>",
   "confidence": 1.0,
+  "source": "TENANT_CUSTOM_REGEX",
   "timestamp": "2026-02-22T00:00:01Z"
 }
 ```
@@ -504,10 +523,10 @@ CREATE INDEX idx_events_sanitized_payload ON events_sanitized USING GIN (sanitiz
 CREATE TABLE audit_records (
     audit_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_id        UUID NOT NULL REFERENCES events_sanitized(id),
-    step            TEXT NOT NULL,
-    before_digest   TEXT NOT NULL,  -- SHA-256 of original snippet
-    after_snippet   TEXT,
-    actor           TEXT NOT NULL,
+    entity_type     TEXT NOT NULL,
+    original_value  TEXT NOT NULL,  -- Original string
+    redacted_value  TEXT NOT NULL,  -- What was it replaced with
+    source          TEXT NOT NULL,  -- REGEX, NER_PRESIDIO, TENANT_KMS
     confidence      NUMERIC(4,3),
     timestamp       TIMESTAMPTZ NOT NULL DEFAULT now()
 ) PARTITION BY RANGE (timestamp);
@@ -839,8 +858,30 @@ Test coverage targets:
 
 ### 14.1 Docker Compose (Local Dev)
 
+The local stack spins up the entire streaming pipeline, using **MinIO** as an S3-compatible backend for state checkpoints and Apache Iceberg.
+
 ```yaml
 services:
+  minio:
+    image: minio/minio:RELEASE.2023-10-24T04-42-36Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+
+  minio-init:
+    image: minio/mc
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/flink-checkpoints;
+      mc mb local/iceberg-warehouse;
+      exit 0;
+      "
+
   pulsar:
     image: apachepulsar/pulsar:3.1.0
     command: bin/pulsar standalone
@@ -953,17 +994,19 @@ Resolve an escalation (human review outcome).
 
 ## 16. Implementation Milestones
 
-| Phase       | Duration | Deliverables                                                                                                               |
-| ----------- | -------- | -------------------------------------------------------------------------------------------------------------------------- |
-| **MVP**     | 4–7 days | Spring Boot ingest API → Pulsar → Flink job (deterministic redaction only) → Postgres sink → Grafana metrics dashboard     |
-| **Phase 2** | 5–8 days | NER microservice integration (Flink async I/O); DLQ; audit table with immutability rules; Testcontainers integration tests |
-| **Phase 3** | 3–5 days | Abuse classifier (ONNX); escalation policy engine (Broadcast State); mocked LLM adapter; provenance in every event         |
-| **Phase 4** | 3–6 days | Real LLM adapter with circuit breaker; KMS pseudonymization; pgvector embeddings; human review API; perf load test         |
-| **Phase 5** | 2–4 days | Docker Compose dev stack fully wired; README + demo script; architecture diagram finalized; CI pipeline (GitHub Actions)   |
+| Phase       | Duration | Deliverables                                                                                                                                                   |
+| ----------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MVP**     | 3–5 days | Spring Boot ingest API → Pulsar → **Spark Streaming / Flink** (deterministic redaction) → Postgres sink. (Starting with Spark for faster iteration/debugging). |
+| **Phase 2** | 5–8 days | NER microservice integration (Flink async I/O); DLQ; audit table with immutability rules; Testcontainers integration tests                                     |
+| **Phase 3** | 3–5 days | Abuse classifier (ONNX); escalation policy engine (Broadcast State); mocked LLM adapter; provenance in every event                                             |
+| **Phase 4** | 3–6 days | Real LLM adapter with circuit breaker; KMS pseudonymization; pgvector embeddings; human review API; perf load test                                             |
+| **Phase 5** | 2–4 days | Docker Compose dev stack fully wired; README + demo script; architecture diagram finalized; CI pipeline (GitHub Actions)                                       |
 
 ---
 
 ## 17. Key Design Decisions & Trade-offs
+
+### 17.1 Architecture Choices
 
 | Decision           | Chosen                 | Alternative                             | Why                                                                                                                           |
 | ------------------ | ---------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -975,6 +1018,28 @@ Resolve an escalation (human review outcome).
 | Audit immutability | Postgres rules         | Separate append-only log (Kafka/Pulsar) | Simplifies query; foreign keys to events_sanitized; rules prevent accidental mutation                                         |
 | LLM isolation      | Redacted context only  | Full payload                            | PII safety is non-negotiable; structured features + redacted snippet are sufficient for abuse classification                  |
 | State backend      | RocksDB                | In-memory (heap)                        | RocksDB handles state larger than JVM heap; incremental checkpoints; required for production throughput                       |
+
+---
+
+### 17.2 Alternative Engine Selection (Spark vs. Flink)
+
+| Feature             | Spark Structured Streaming                           | Apache Flink                                         |
+| :------------------ | :--------------------------------------------------- | :--------------------------------------------------- |
+| **Philosophy**      | "Batch is a special case of streaming" (Micro-batch) | "Streaming is the fundamental building block" (True) |
+| **Ease of Use**     | **High**: Familiar DataFrames/SQL, easy to debug     | **Medium**: Rich API but steeper learning curve      |
+| **Latency**         | 100ms - 1s (Micro-batch overhead)                    | **< 10ms (Event-at-a-time)**                         |
+| **Stateful Ops**    | Good (Stateful mapping)                              | **Best-in-class** (RocksDB, 2PC, Side Outputs)       |
+| **Showcase Signal** | "Senior Data Engineer" (Broad versatility)           | "Senior Systems/Real-time Engineer" (Specialized)    |
+
+**The Pivot Strategy**: Start with **Spark Streaming** for the initial showcase. It is significantly easier to implement, local testing is faster, and the community support for "Getting Started" is massive.
+
+### 17.3 Engine-Agnostic Core Logic
+
+To ensure the system can pivot to Flink as traffic scales (or for specific low-latency requirements), we decouple business logic from the streaming framework:
+
+1.  **Shared Logic Library (`lib-detection`)**: All Regex, NER-calling logic, and PII masking functions are written as standard POJOs (Plain Old Java Objects).
+2.  **Pluggable Runners**: The Spark job and Flink job are just "wrappers" that handle Pulsar connectivity and checkpointing, but they both call the same `RedactorService`.
+3.  **Apache Beam (Roadmap)**: For a truly engine-agnostic approach, **Apache Beam** allows writing the pipeline logic once and running it on Flink, Spark, or Google Cloud Dataflow without code changes.
 
 ---
 
@@ -1119,6 +1184,18 @@ Answer: Flink's web UI shows operator back-pressure indicators. Prometheus metri
 
 ---
 
+### 18.11 "Why did you start with Spark Streaming instead of Flink?"
+
+**Model Answer:**
+_"I chose a **Hybrid Architecture Strategy**. For the initial build, **Spark Structured Streaming** provided the fastest path to a working showcase because of its high-level DataFrame API and robust debugging tools. However, I designed the core detection logic as an **engine-agnostic library**. This allows us to pivot to **Apache Flink**—which is the ultimate goal for sub-second latency and exactly-once state management—without rewriting our PII detectors. It's about delivering value quickly while maintaining a clear technical roadmap for high-scale performance."_
+
+### 18.12 "What's the role of Trino/Presto in this stack?"
+
+**Model Answer:**
+_"Flink and Spark are our **Processing Engines** for 'Data in Motion'. They clean the data as it flows. But once that data lands in our Iceberg Lakehouse (S3), we need an **Analytical Engine** for BI and Security Research. **Trino** excels at interactive SQL queries across massive datasets at rest. By having both, we solve for real-time compliance (Flink/Spark) and long-term analytical insight (Trino)."_
+
+---
+
 ## Paths
 
 - `ingestion-pipeline/DESIGN.md` — this file
@@ -1128,10 +1205,12 @@ Answer: Flink's web UI shows operator back-pressure indicators. Prometheus metri
 
 - `DESIGN.md` (this file)
 - `ingestion.mmd` (Mermaid diagram — see next section for updated version)
-- `docker-compose.yml` — full local dev stack
-- `ingest-api/` — Spring Boot REST API + Pulsar producer
+- `docker-compose.yml` — full local dev stack including MinIO, Pulsar, and Postgres.
+- `ingest-api/` — Spring Boot REST API + GraalVM Native Image compilation profile.
 - `flink-job/` — Flink streaming job (Java, Maven)
-- `ner-service/` — FastAPI + spaCy NER microservice (Python)
+- `spark-job/` — Alternative Spark Structured Streaming job (Scala/Java)
+- `lib-detection/` — Engine-agnostic core logic library
+- `ner-service/` — FastAPI + Microsoft Presidio / spaCy NER microservice
 - `llm-adapter/` — LLM adapter stub + real provider implementations
 - `tests/` — Testcontainers integration tests + load test scripts
 - `grafana/` — pre-built Grafana dashboard JSON

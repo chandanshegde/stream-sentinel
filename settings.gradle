@@ -1,0 +1,4 @@
+rootProject.name = 'stream-sentinel'
+include 'lib-detection'
+include 'ingest-api'
+include 'spark-job'

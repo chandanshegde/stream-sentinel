@@ -12,16 +12,16 @@ flowchart TD
     DLQ["persistent://{tenant}/ingestion/dlq\n4 partitions · 30d retention"]
   end
 
-  subgraph FlinkJob["🟩 Flink Streaming Job (Java)"]
+  subgraph ProcessingEngine["🟩 Processing Engine (Spark Streaming / Flink)"]
     direction TB
-    F1["① Parse & Validate\nJSON/Protobuf · Side-output DLQ\nparallelism=16"]
-    F2["② Redaction (Regex + WASM)\nEmbedded WASM UDFs per tenant\nStateless · parallelism=16"]
-    F3["③ Async NER Call\nArrow Flight (Zero-copy RPC)\nBatch=64 · timeout=5s · parallelism=8"]
-    F4["④ Abuse Scoring\nEmbedded DJL + ONNX\nDistilBERT natively in JVM · parallelism=8"]
-    F5["⑤ Escalation Decision\nKeyedProcessFunction on tenantId\nBroadcastState for tenant policy"]
-    F6["⑥ Async LLM Adapter\nAsyncDataStream.orderedWait\nmaxInFlight=20 · circuit-breaker · parallelism=4"]
+    F1["① Parse & Validate\nJSON/Protobuf · Side-output DLQ"]
+    F2["② Redaction (Regex + WASM)\nEmbedded WASM UDFs per tenant\nStateless Core"]
+    F3["③ Async NER Call\nMicrosoft Presidio / spaCy\nArrow Flight (Zero-copy RPC)"]
+    F4["④ Abuse Scoring\nEmbedded DJL + ONNX\nDistilBERT natively in JVM"]
+    F5["⑤ Escalation Decision\nKeyed State on tenantId\nBroadcastState for tenant policy"]
+    F6["⑥ Async LLM Adapter\nAsyncDataStream.orderedWait\nmaxInFlight=20 · circuit-breaker"]
     F7["⑦ Finalize Redaction\nHMAC-SHA256 pseudonymization\nKMS-managed salt per tenant"]
-    F8["⑧ Sinks\nTwoPhaseCommitSink\nPulsar + Postgres + Iceberg"]
+    F8["⑧ Sinks\nExactly-Once commit\nPulsar + Postgres + Iceberg"]
 
     F1 -->|valid| F2
     F1 -->|invalid| DLQ
@@ -35,7 +35,7 @@ flowchart TD
   end
 
   subgraph NERService["🟪 NER Microservice"]
-    NER["NER Worker \nPython + spaCy / Rust\nArrow Flight Server\nSidecar pod"]
+    NER["NER Worker \nMicrosoft Presidio + spaCy\nArrow Flight Server\nSidecar pod"]
   end
 
   subgraph LLMAdapterSvc["🟥 LLM Adapter"]
@@ -49,7 +49,7 @@ flowchart TD
   end
 
   subgraph Downstream["📤 Downstream Consumers"]
-    ANA["Analytics / BI\nAthena / Flink batch over Iceberg"]
+    ANA["Analytics / BI\nTrino / Athena over Iceberg"]
     CHAT["AI Chatbot\nRAG over audit + sanitized events\npgvector similarity search"]
     MOD["Human Review UI\nEscalations queue\nPATCH /escalations/{id}"]
   end
@@ -75,7 +75,7 @@ flowchart TD
   PG --> CHAT
   PG --> MOD
 
-  FlinkJob -->|metrics| PROM
+  ProcessingEngine -->|metrics| PROM
   NER -->|traces| OTEL
   LLMAdapterSvc -->|traces| OTEL
   A -->|traces| OTEL

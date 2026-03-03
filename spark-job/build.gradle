@@ -1,0 +1,14 @@
+plugins {
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+dependencies {
+    implementation project(':lib-detection')
+    compileOnly "org.apache.spark:spark-sql_2.12:3.4.0"
+    implementation "io.streamnative.connectors:pulsar-spark-connector_2.12:3.4.0.4"
+}
+
+shadowJar {
+    archiveFileName = 'spark-job-all.jar'
+    mergeServiceFiles()
+}

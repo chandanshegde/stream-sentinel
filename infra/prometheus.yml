@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "ingest-api"
+    metrics_path: "/actuator/prometheus"
+    static_configs:
+      - targets: ["ingest-api:8081"]
+
+  - job_name: "spark-job"
+    static_configs:
+      - targets: ["spark-job:4040"]
